@@ -1,0 +1,120 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      # Ajuste conforme seu projeto
+      MODULE_PATH: app
+      # SDKs usados pelo teu projeto (mantive 33 p/ compat)
+      ANDROID_COMPILE_SDK: "33"
+      ANDROID_BUILD_TOOLS: "33.0.2"
+      ANDROID_TARGET_SDK: "33"
+      ANDROID_MIN_SDK: "24"
+      # Opcional: usa o número da execução como versionCode
+      VERSION_CODE: ${{ github.run_number }}
+      VERSION_NAME: 1.0.${{ github.run_number }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+          cache: gradle
+
+      - name: Cache Gradle
+        uses: gradle/gradle-build-action@v3
+
+      - name: Install Android SDK components
+        run: |
+          sudo mkdir -p /usr/local/lib/android/sdk/cmdline-tools
+          sudo curl -sSL https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -o /tmp/cmdline-tools.zip
+          sudo unzip -q /tmp/cmdline-tools.zip -d /usr/local/lib/android/sdk/cmdline-tools
+          sudo mv /usr/local/lib/android/sdk/cmdline-tools/cmdline-tools /usr/local/lib/android/sdk/cmdline-tools/latest
+          export ANDROID_SDK_ROOT=/usr/local/lib/android/sdk
+          yes | /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager --licenses
+          /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager \
+            "platform-tools" \
+            "platforms;android-${ANDROID_COMPILE_SDK}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}"
+
+      - name: Inject versionCode/versionName (opcional)
+        if: ${{ always() }}
+        run: |
+          # Ajusta versionCode/versionName no build.gradle via sed sem quebrar o arquivo
+          FILE="${{ env.MODULE_PATH }}/build.gradle"
+          if [ -f "$FILE" ]; then
+            sed -i 's/versionCode [0-9][0-9]*/versionCode '"${{ env.VERSION_CODE }}"'/' "$FILE" || true
+            sed -i 's/versionName "[^"]*"/versionName "'"${{ env.VERSION_NAME }}"'"/' "$FILE" || true
+          fi
+          FILE_KTS="${{ env.MODULE_PATH }}/build.gradle.kts"
+          if [ -f "$FILE_KTS" ]; then
+            sed -i 's/versionCode = [0-9][0-9]*/versionCode = '"${{ env.VERSION_CODE }}"'/' "$FILE_KTS" || true
+            sed -i 's/versionName = "[^"]*"/versionName = "'"${{ env.VERSION_NAME }}"'"/' "$FILE_KTS" || true
+          fi
+
+      - name: Make Gradle executable
+        run: chmod +x gradlew
+
+      - name: Assemble Debug (APK universal)
+        env:
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+        run: |
+          ./gradlew \
+            -Pandroid.injected.testOnly=false \
+            :${{ env.MODULE_PATH }}:assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: |
+            ${{ env.MODULE_PATH }}/build/outputs/apk/debug/*.apk
+
+      # ===== Assinatura de RELEASE (opcional) =====
+      - name: Prepare keystore (release signing)
+        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
+
+      - name: Assemble Release (assinado se você usa signingConfigs.release)
+        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        env:
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          # Se seu build usa signingConfigs.release lendo vars do gradle.properties ou env, já funciona.
+          # Exemplo de injeção temporária em gradle.properties:
+          {
+            echo "RELEASE_STORE_FILE=$(pwd)/keystore.jks"
+            echo "RELEASE_STORE_PASSWORD=${KEYSTORE_PASSWORD}"
+            echo "RELEASE_KEY_ALIAS=${KEY_ALIAS}"
+            echo "RELEASE_KEY_PASSWORD=${KEY_PASSWORD}"
+            echo "org.gradle.jvmargs=-Xmx3g -Dkotlin.daemon.jvm.options=-Xmx2g"
+          } >> ~/.gradle/gradle.properties
+          ./gradlew \
+            -Pandroid.injected.testOnly=false \
+            :${{ env.MODULE_PATH }}:assembleRelease
+
+      - name: Upload release APK
+        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: |
+            ${{ env.MODULE_PATH }}/build/outputs/apk/release/*.apk
+            ${{ env.MODULE_PATH }}/build/outputs/mapping/release/mapping.txt
